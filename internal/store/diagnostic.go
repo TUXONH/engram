@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -30,6 +32,21 @@ type OrphanedObservationSessionEvidence struct {
 	SessionID        string `json:"session_id"`
 	ObservationCount int64  `json:"observation_count"`
 	FirstObservedAt  string `json:"first_observed_at"`
+}
+
+// EndedSessionPostEndActivityEvidence describes a conversation, a root session
+// plus its `<root>:resume:N` continuations (nested ones included, and counted
+// in ContinuationCount), whose rows are all ended while user
+// prompts kept arriving after its latest end. It carries ids, counts, and
+// timestamps only, never prompt content.
+type EndedSessionPostEndActivityEvidence struct {
+	SessionID             string `json:"session_id"`
+	Project               string `json:"project"`
+	EndedAt               string `json:"ended_at"`
+	LatestPostEndPromptAt string `json:"latest_post_end_prompt_at"`
+	PostEndPromptCount    int64  `json:"post_end_prompt_count"`
+	ContinuationState     string `json:"continuation_state"`
+	ContinuationCount     int    `json:"continuation_count"`
 }
 
 // OrphanedSessionPlaceholder is the minimal local-only session record used to
@@ -235,6 +252,160 @@ func (s *Store) ListOrphanedObservationSessionEvidence(project string) ([]Orphan
 		return nil, err
 	}
 	return evidence, nil
+}
+
+// ListEndedSessionPostEndActivity reports conversations that kept receiving
+// user prompts after every session in them ended. Memory writes to an ended
+// session fail with session_already_ended, but prompt capture does not check
+// ended_at, so a prompt stored after the conversation's latest end shows that
+// the host kept working without an open continuation. Each conversation is
+// reported once, keyed by its root session, and only prompts newer than its
+// latest end count, so activity that a later continuation already picked up is
+// not reported. Timestamps are compared through datetime() because ended_at is
+// written by datetime('now') while imported rows may carry RFC 3339 values; a
+// prompt time datetime() cannot parse never counts as activity, and a
+// conversation with an end time it cannot parse is not reported, because its
+// latest end is unknown. A project scope matches the conversation's root
+// session, or its lowest-ordinal continuation when the root row is missing,
+// so a reported conversation always carries the scoped project.
+func (s *Store) ListEndedSessionPostEndActivity(project string) ([]EndedSessionPostEndActivityEvidence, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	// Discovery is not scoped: post-end prompts on a continuation in another
+	// project still belong to a conversation whose root may be in scope.
+	rows, err := s.queryItHook(s.db, `SELECT DISTINCT s.id FROM sessions s
+		JOIN user_prompts p ON p.session_id = s.id
+		WHERE s.ended_at IS NOT NULL
+			AND datetime(p.created_at) > datetime(s.ended_at)`)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	roots := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, closeRowsWithError(rows, err)
+		}
+		if root := conversationRoot(id); !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, closeRowsWithError(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	sort.Strings(roots)
+
+	evidence := make([]EndedSessionPostEndActivityEvidence, 0, len(roots))
+	for _, root := range roots {
+		item, found, err := s.endedConversationPostEndActivity(root, project)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			evidence = append(evidence, item)
+		}
+	}
+	return evidence, nil
+}
+
+// endedConversationPostEndActivity evaluates one conversation. It reports
+// nothing while the root or any continuation is still open, because that row
+// can still accept the writes, or when a non-empty project does not match the
+// conversation's project: the root's, or the lowest-ordinal continuation's
+// when the root row is missing.
+func (s *Store) endedConversationPostEndActivity(root, project string) (EndedSessionPostEndActivityEvidence, bool, error) {
+	item := EndedSessionPostEndActivityEvidence{SessionID: root, ContinuationState: "none"}
+	prefix := root + ":resume:"
+	// Same literal range as continuationSessionsQuery, plus the root row,
+	// which sorts first.
+	rows, err := s.queryItHook(s.db, `SELECT id, ifnull(project, ''), ended_at FROM sessions
+		WHERE id = ? OR (id >= ? AND id < ?) ORDER BY id`, root, prefix+"0", prefix+":")
+	if err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, err
+	}
+	ids := make([]any, 0)
+	open := false
+	hasRoot := false
+	var projectOrdinal *big.Int
+	for rows.Next() {
+		var id, rowProject string
+		var endedAt *string
+		if err := rows.Scan(&id, &rowProject, &endedAt); err != nil {
+			return EndedSessionPostEndActivityEvidence{}, false, closeRowsWithError(rows, err)
+		}
+		if id == root {
+			hasRoot = true
+			item.Project = rowProject
+		} else {
+			// The range also holds nested continuations of a continuation;
+			// they belong to this conversation when every suffix is valid.
+			if conversationRoot(id) != root {
+				continue
+			}
+			item.ContinuationCount++
+			// The root row sorts before every continuation, so hasRoot is final
+			// here. Without it, the project comes from the lowest first ordinal:
+			// ids sort as strings, so resume:10 precedes resume:2.
+			if !hasRoot {
+				// conversationRoot already validated every suffix, so the
+				// first ordinal always parses.
+				first, _, _ := strings.Cut(strings.TrimPrefix(id, prefix), ":resume:")
+				n, _ := continuationOrdinal(prefix, prefix+first)
+				if projectOrdinal == nil || n.Cmp(projectOrdinal) < 0 {
+					projectOrdinal = n
+					item.Project = rowProject
+				}
+			}
+		}
+		ids = append(ids, id)
+		open = open || endedAt == nil
+	}
+	if err := rows.Err(); err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, closeRowsWithError(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, err
+	}
+	if open || len(ids) == 0 || (project != "" && item.Project != project) {
+		return EndedSessionPostEndActivityEvidence{}, false, nil
+	}
+	if item.ContinuationCount > 0 {
+		item.ContinuationState = "ended"
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	// MAX alone would skip an unparseable end and fall back to an earlier one,
+	// counting prompts a later continuation already handled. Any unparseable
+	// end leaves the latest end NULL, so no prompt counts.
+	query := fmt.Sprintf(`WITH latest_end AS (
+			SELECT CASE WHEN COUNT(*) = COUNT(datetime(ended_at)) THEN MAX(datetime(ended_at)) END AS at
+			FROM sessions WHERE id IN (%[1]s)
+		)
+		SELECT ifnull((SELECT at FROM latest_end), ''), COUNT(*), ifnull(MAX(datetime(created_at)), '')
+		FROM user_prompts
+		WHERE session_id IN (%[1]s) AND datetime(created_at) > (SELECT at FROM latest_end)`, placeholders)
+	args := append(append(make([]any, 0, 2*len(ids)), ids...), ids...)
+	rows, err = s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, err
+	}
+	if rows.Next() {
+		if err := rows.Scan(&item.EndedAt, &item.PostEndPromptCount, &item.LatestPostEndPromptAt); err != nil {
+			return EndedSessionPostEndActivityEvidence{}, false, closeRowsWithError(rows, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, closeRowsWithError(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return EndedSessionPostEndActivityEvidence{}, false, err
+	}
+	return item, item.PostEndPromptCount > 0, nil
 }
 
 // RestoreOrphanedObservationSessions creates immediately-ended, local-only

@@ -42,6 +42,7 @@ func DefaultRegistry() Registry {
 		OrphanedPendingRelationsCheck{},
 		UnownedSessionProjectCheck{},
 		AmbiguousActiveRuntimeSessionsCheck{},
+		EndedSessionPostEndActivityCheck{},
 		SyncMutationRequiredFieldsCheck{},
 		SyncTargetClosedSpaceCheck{},
 		SQLiteLockContentionCheck{},

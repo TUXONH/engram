@@ -3517,14 +3517,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 		if err := rows.Scan(&id, &ended); err != nil {
 			return "", err
 		}
-		if !strings.HasPrefix(id, prefix) {
-			continue
-		}
-		suffix := strings.TrimPrefix(id, prefix)
-		if suffix == "" || strings.IndexFunc(suffix, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-			continue
-		}
-		n, ok := new(big.Int).SetString(suffix, 10)
+		n, ok := continuationOrdinal(prefix, id)
 		if !ok {
 			continue
 		}
@@ -3544,6 +3537,35 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 		return liveID, nil
 	}
 	return prefix + max.Add(max, big.NewInt(1)).String(), nil
+}
+
+// continuationOrdinal parses N from a `<root>:resume:N` id, where prefix is
+// `<root>:resume:`. N must be a non-empty run of ASCII digits.
+func continuationOrdinal(prefix, id string) (*big.Int, bool) {
+	if !strings.HasPrefix(id, prefix) {
+		return nil, false
+	}
+	suffix := strings.TrimPrefix(id, prefix)
+	if suffix == "" || strings.IndexFunc(suffix, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return nil, false
+	}
+	return new(big.Int).SetString(suffix, 10)
+}
+
+// conversationRoot returns the outermost root session id of a
+// `<root>:resume:N` continuation, stripping nested `:resume:N` suffixes such
+// as `<root>:resume:2:resume:3`, or id itself when it is not a continuation.
+func conversationRoot(id string) string {
+	for {
+		i := strings.LastIndex(id, ":resume:")
+		if i <= 0 {
+			return id
+		}
+		if _, ok := continuationOrdinal(id[:i]+":resume:", id); !ok {
+			return id
+		}
+		id = id[:i]
+	}
 }
 
 func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool, timings *WriteTimings, evidence ...*ProjectProvenance) error {

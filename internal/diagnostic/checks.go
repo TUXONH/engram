@@ -23,6 +23,7 @@ const (
 	CheckUnownedSessionProject            = "unowned_session_project"
 	CheckSQLiteLockContention             = "sqlite_lock_contention"
 	CheckAmbiguousActiveRuntimeSessions   = "ambiguous_active_runtime_sessions"
+	CheckEndedSessionPostEndActivity      = "ended_session_post_end_activity"
 )
 
 // ReasonQuarantinedPulledSessionIdentity marks a finding of
@@ -42,6 +43,12 @@ const ReasonForeignSyncTarget = "foreign_sync_target"
 // evidence.
 const orphanedPendingRelationSampleLimit = 10
 
+// resumedSessionBindingRelease is the first release whose Claude plugin binds a
+// resumed session to its live continuation (#1765). An older plugin keeps
+// writing to the ended root, which is one way ended_session_post_end_activity
+// arises. docs/DOCTOR.md names the same release; a test keeps them in sync.
+const resumedSessionBindingRelease = "v3.5.0"
+
 type SessionProjectDirectoryMismatchCheck struct{}
 type ManualSessionNameProjectMismatchCheck struct{}
 type SyncMutationRequiredFieldsCheck struct{}
@@ -52,6 +59,7 @@ type OrphanedPendingRelationsCheck struct{}
 type UnownedSessionProjectCheck struct{}
 type SQLiteLockContentionCheck struct{}
 type AmbiguousActiveRuntimeSessionsCheck struct{}
+type EndedSessionPostEndActivityCheck struct{}
 
 func (SessionProjectDirectoryMismatchCheck) Code() string {
 	return CheckSessionProjectDirectoryMismatch
@@ -69,6 +77,7 @@ func (SQLiteLockContentionCheck) Code() string       { return CheckSQLiteLockCon
 func (AmbiguousActiveRuntimeSessionsCheck) Code() string {
 	return CheckAmbiguousActiveRuntimeSessions
 }
+func (EndedSessionPostEndActivityCheck) Code() string { return CheckEndedSessionPostEndActivity }
 
 func (c AmbiguousActiveRuntimeSessionsCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
 	_ = ctx
@@ -140,6 +149,28 @@ func (c AmbiguousActiveRuntimeSessionsCheck) Run(ctx context.Context, scope Scop
 		})
 	}
 	return resultFromFindings(c.Code(), map[string]any{"projects_evaluated": len(projects)}, findings), nil
+}
+
+func (c EndedSessionPostEndActivityCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
+	_ = ctx
+	evidence, err := scope.Store.ListEndedSessionPostEndActivity(scope.Project)
+	if err != nil {
+		return CheckResult{}, err
+	}
+	findings := make([]Finding, 0, len(evidence))
+	for _, item := range evidence {
+		findings = append(findings, Finding{
+			CheckID:              c.Code(),
+			Severity:             SeverityWarning,
+			ReasonCode:           CheckEndedSessionPostEndActivity,
+			Message:              fmt.Sprintf("Session %q has %d prompt(s) recorded after its latest end at %s and no open continuation.", item.SessionID, item.PostEndPromptCount, item.EndedAt),
+			Why:                  "Memory writes to an ended session fail with `session_already_ended`, and this conversation has no open `<id>:resume:N` continuation, so prompts captured after its latest end indicate the host kept working while its writes were refused. Doctor infers this from captured prompts with second precision and cannot prove that a specific write was denied.",
+			Evidence:             mustJSON(item),
+			SafeNextStep:         "Resume the conversation or start a new one so SessionStart opens a continuation. If the Engram plugin or hook binary predates " + resumedSessionBindingRelease + ", update it first so resumed sessions bind to their live continuation. Doctor is diagnostic-only and never ends, registers, or reopens sessions.",
+			RequiresConfirmation: false,
+		})
+	}
+	return resultFromFindings(c.Code(), map[string]any{"conversations_reported": len(evidence)}, findings), nil
 }
 
 func (c SessionProjectDirectoryMismatchCheck) Run(ctx context.Context, scope Scope) (CheckResult, error) {
